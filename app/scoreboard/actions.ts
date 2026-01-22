@@ -1,68 +1,90 @@
 "use server";
 
 import { supabaseServer } from "@/lib/supabase/server";
+import { denverTodayISODate } from "@/lib/date/denver";
 
-export type ScoreboardParticipant = {
+const TODAY_TOTAL = 6;
+
+export type ScoreboardCardRow = {
   user_id: string;
   display_name: string;
+  participant_start_date: string;
+  participant_length_days: number;
+
+  day_number: number; // 0 if not started yet
+  starts_in_days: number | null;
+
+  today_complete: number;
+  today_total: number;
 };
 
-export type ScoreboardDay = {
-  dayIndex: number;
-  dayDate: string;
-  statusByUser: Record<string, boolean>;
-};
+function daysBetweenISO(startISO: string, endISO: string) {
+  // Use noon UTC to reduce DST weirdness
+  const start = new Date(`${startISO}T12:00:00Z`);
+  const end = new Date(`${endISO}T12:00:00Z`);
+  return Math.floor((end.getTime() - start.getTime()) / 86_400_000);
+}
 
-type RpcRow = {
-  day_index: number;
-  day_date: string;
-  user_id: string;
-  display_name: string;
-  day_complete: boolean;
-};
-
-export async function fetchScoreboardGrid(): Promise<{
+export async function fetchScoreboardTodayCards(): Promise<{
   challengeId: string;
-  participants: ScoreboardParticipant[];
-  days: ScoreboardDay[];
+  dayDate: string;
+  rows: ScoreboardCardRow[];
 }> {
   const supabase = await supabaseServer();
   const challengeId = process.env.NEXT_PUBLIC_CHALLENGE_ID!;
+  const dayDate = denverTodayISODate();
 
   const { data: auth, error: authErr } = await supabase.auth.getUser();
   if (authErr) throw authErr;
   if (!auth.user) throw new Error("Not authenticated");
 
-  const { data, error } = await supabase.rpc("scoreboard_grid", {
-    p_challenge_id: challengeId,
+  // Participants
+  const { data: participants, error: pErr } = await supabase
+    .from("challenge_participants")
+    .select("user_id, display_name, participant_start_date, participant_length_days, created_at")
+    .eq("challenge_id", challengeId)
+    .order("created_at", { ascending: true });
+
+  if (pErr) throw pErr;
+
+  // Today's checkins + items for anyone who has a checkin row today
+  const { data: checkins, error: cErr } = await supabase
+    .from("daily_checkins")
+    .select(
+      `
+      user_id,
+      checkin_items ( is_complete )
+    `
+    )
+    .eq("challenge_id", challengeId)
+    .eq("day_date", dayDate);
+
+  if (cErr) throw cErr;
+
+  const completeByUser = new Map<string, number>();
+  for (const c of checkins ?? []) {
+    const items = (c as any).checkin_items ?? [];
+    const complete = items.filter((i: any) => i.is_complete).length;
+    completeByUser.set((c as any).user_id, complete);
+  }
+
+  const rows: ScoreboardCardRow[] = (participants ?? []).map((p: any) => {
+    const dayOffset = daysBetweenISO(p.participant_start_date, dayDate);
+    const started = dayOffset >= 0;
+
+    return {
+      user_id: p.user_id,
+      display_name: p.display_name,
+      participant_start_date: p.participant_start_date,
+      participant_length_days: p.participant_length_days,
+
+      day_number: started ? dayOffset + 1 : 0,
+      starts_in_days: started ? null : Math.abs(dayOffset),
+
+      today_complete: completeByUser.get(p.user_id) ?? 0,
+      today_total: TODAY_TOTAL,
+    };
   });
 
-  if (error) throw error;
-
-  const rows = (data ?? []) as RpcRow[];
-
-  const participants: ScoreboardParticipant[] = [];
-  const seen = new Set<string>();
-  for (const r of rows) {
-    if (r.day_index !== 1) continue;
-    if (seen.has(r.user_id)) continue;
-    seen.add(r.user_id);
-    participants.push({ user_id: r.user_id, display_name: r.display_name });
-  }
-
-  const byDay = new Map<number, ScoreboardDay>();
-  for (const r of rows) {
-    if (!byDay.has(r.day_index)) {
-      byDay.set(r.day_index, {
-        dayIndex: r.day_index,
-        dayDate: r.day_date,
-        statusByUser: {},
-      });
-    }
-    byDay.get(r.day_index)!.statusByUser[r.user_id] = !!r.day_complete;
-  }
-
-  const days = Array.from(byDay.values()).sort((a, b) => a.dayIndex - b.dayIndex);
-
-  return { challengeId, participants, days };
+  return { challengeId, dayDate, rows };
 }
