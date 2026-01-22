@@ -13,6 +13,13 @@ const ITEM_KEYS = [
   "no_alcohol",
 ] as const;
 
+function extFromType(type: string) {
+  if (type === "image/jpeg") return "jpg";
+  if (type === "image/png") return "png";
+  if (type === "image/webp") return "webp";
+  return "jpg";
+}
+
 export async function ensureTodayCheckin() {
   const supabase = await supabaseServer();
   const challengeId = process.env.NEXT_PUBLIC_CHALLENGE_ID!;
@@ -100,11 +107,87 @@ export async function fetchToday() {
   return data;
 }
 
-function extFromType(type: string) {
-  if (type === "image/jpeg") return "jpg";
-  if (type === "image/png") return "png";
-  if (type === "image/webp") return "webp";
-  return "jpg";
+export async function setCheckinItemComplete(
+  checkinItemId: string,
+  isComplete: boolean
+) {
+  const supabase = await supabaseServer();
+
+  const { data: auth, error: authErr } = await supabase.auth.getUser();
+  if (authErr) throw authErr;
+  if (!auth.user) throw new Error("Not authenticated");
+
+  // Read the item key first
+  const { data: item, error: itemErr } = await supabase
+    .from("checkin_items")
+    .select("item_key")
+    .eq("id", checkinItemId)
+    .single();
+
+  if (itemErr) throw itemErr;
+
+  const key = String(item.item_key);
+  const proofRequired = ["workouts", "water", "reading", "progress_photo"].includes(key);
+
+  // Only diet + no_alcohol can be toggled manually
+  if (proofRequired && isComplete) {
+    const { count, error: countErr } = await supabase
+      .from("item_proofs")
+      .select("id", { head: true, count: "exact" })
+      .eq("checkin_item_id", checkinItemId);
+
+    if (countErr) throw countErr;
+    if ((count ?? 0) < 1) {
+      throw new Error("Proof required. Upload a photo first.");
+    }
+  }
+
+  if (!proofRequired && !["diet", "no_alcohol"].includes(key)) {
+    throw new Error("This item cannot be edited directly.");
+  }
+
+  const { error } = await supabase
+    .from("checkin_items")
+    .update({ is_complete: isComplete })
+    .eq("id", checkinItemId);
+
+  if (error) throw error;
+
+  revalidatePath("/today");
+  revalidatePath("/scoreboard");
+}
+
+export async function setCheckinItemNote(checkinItemId: string, note: string | null) {
+  const supabase = await supabaseServer();
+
+  const { data: auth, error: authErr } = await supabase.auth.getUser();
+  if (authErr) throw authErr;
+  if (!auth.user) throw new Error("Not authenticated");
+
+  const { data: item, error: itemErr } = await supabase
+    .from("checkin_items")
+    .select("item_key")
+    .eq("id", checkinItemId)
+    .single();
+
+  if (itemErr) throw itemErr;
+
+  const key = String(item.item_key);
+  if (!["diet", "no_alcohol"].includes(key)) {
+    throw new Error("Notes are only allowed for diet and no alcohol.");
+  }
+
+  const cleaned = note?.trim() ? note.trim() : null;
+
+  const { error } = await supabase
+    .from("checkin_items")
+    .update({ note: cleaned })
+    .eq("id", checkinItemId);
+
+  if (error) throw error;
+
+  revalidatePath("/today");
+  revalidatePath("/scoreboard");
 }
 
 export async function uploadProofAction(formData: FormData) {
@@ -115,7 +198,7 @@ export async function uploadProofAction(formData: FormData) {
   if (!file) throw new Error("Missing file");
   if (!file.type.startsWith("image/")) throw new Error("File must be an image");
 
-  const maxBytes = 4 * 1024 * 1024; // 4MB
+  const maxBytes = 4 * 1024 * 1024;
   if (file.size > maxBytes) throw new Error("Image too large (max 4MB)");
 
   const supabase = await supabaseServer();
@@ -131,10 +214,7 @@ export async function uploadProofAction(formData: FormData) {
 
   const { error: upErr } = await supabase.storage
     .from("proofs")
-    .upload(storagePath, file, {
-      contentType: file.type,
-      upsert: false,
-    });
+    .upload(storagePath, file, { contentType: file.type, upsert: false });
 
   if (upErr) throw upErr;
 
@@ -146,5 +226,14 @@ export async function uploadProofAction(formData: FormData) {
 
   if (dbErr) throw dbErr;
 
+  // Auto-mark complete when proof uploaded (makes progress_photo painless)
+  const { error: markErr } = await supabase
+    .from("checkin_items")
+    .update({ is_complete: true })
+    .eq("id", checkinItemId);
+
+  if (markErr) throw markErr;
+
   revalidatePath("/today");
+  revalidatePath("/scoreboard");
 }
